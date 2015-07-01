@@ -1,0 +1,815 @@
+From 6875e5ac616a991672ec3b0db50b84625fed8765 Mon Sep 17 00:00:00 2001
+From: Nicholas Flintham <nick@flinny.org>
+Date: Wed, 1 Jul 2015 11:58:47 +0100
+Subject: [PATCH] hima : start adding HTC_DEBUG functions
+
+Change-Id: I9d08c5633caa4c8d6f34915fdff3364758c95648
+---
+ arch/arm64/include/asm/mmu_context.h             |  8 ++++
+ arch/arm64/kernel/head.S                         | 33 ++++++++++++++++
+ arch/arm64/kernel/sleep.S                        | 34 ++++++++++++++++
+ arch/arm64/kernel/traps.c                        | 19 +++++++++
+ arch/arm64/mm/fault.c                            | 17 ++++++++
+ drivers/base/power/wakeup.c                      | 26 +++++++++++++
+ drivers/char/diag/diagfwd_htc.c                  | 44 +++++++++++++++++++++
+ drivers/clk/qcom/clock-generic.c                 | 37 +++++++++++++++++-
+ drivers/clk/qcom/clock.c                         | 10 +++++
+ drivers/clk/qcom/clock.h                         | 12 ++++++
+ drivers/devfreq/devfreq_simple_dev.c             |  9 +++++
+ drivers/firmware/qcom/Kconfig                    |  5 +++
+ drivers/irqchip/irq-gic.c                        | 49 ++++++++++++++++++++++++
+ drivers/platform/msm/msm_bus/msm_bus_adhoc.h     | 14 +++++++
+ drivers/platform/msm/msm_bus/msm_bus_arb_adhoc.c | 30 ++++++++++++++-
+ drivers/power/qcom/idle.h                        |  3 ++
+ fs/pstore/inode.c                                |  6 +++
+ fs/pstore/ram.c                                  | 11 ++++++
+ sound/usb/pcm.c                                  |  6 +++
+ 19 files changed, 371 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/char/diag/diagfwd_htc.c
+
+diff --git a/arch/arm64/include/asm/mmu_context.h b/arch/arm64/include/asm/mmu_context.h
+index a9eee33..311d90c 100644
+--- a/arch/arm64/include/asm/mmu_context.h
++++ b/arch/arm64/include/asm/mmu_context.h
+@@ -30,6 +30,11 @@
+ 
+ #define MAX_ASID_BITS	16
+ 
++#if defined(CONFIG_HTC_DEBUG_RTB)
++#include <linux/htc_debug_tools.h>
++#include <linux/msm_rtb.h>
++#endif
++
+ extern unsigned int cpu_last_asid;
+ 
+ void __init_new_context(struct task_struct *tsk, struct mm_struct *mm);
+@@ -43,6 +48,9 @@ static inline void contextidr_thread_switch(struct task_struct *next)
+ 	"	isb"
+ 	:
+ 	: "r" (task_pid_nr(next)));
++#if defined(CONFIG_HTC_DEBUG_RTB)
++	uncached_logk_pc(LOGK_CTXID, (void *)(uintptr_t)htc_debug_get_sched_clock_ms(), (void *)(uintptr_t)(task_pid_nr(next)));
++#endif
+ }
+ #else
+ static inline void contextidr_thread_switch(struct task_struct *next)
+diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
+index 3e8df23..bc33d16 100644
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -35,6 +35,10 @@
+ #include <asm/page.h>
+ #include <asm/virt.h>
+ 
++#ifdef CONFIG_HTC_DEBUG_FOOTPRINT
++#include <htc_mnemosyne/htc_footprint.h>
++#endif
++
+ /*
+  * swapper_pg_dir is the virtual address of the initial page table. We place
+  * the page tables 3 * PAGE_SIZE below KERNEL_RAM_VADDR. The idmap_pg_dir has
+@@ -606,6 +610,35 @@ ENTRY(secondary_holding_pen)
+ 	bl	el2_setup			// Drop to EL1, w20=cpu_boot_mode
+ 	bl	__calc_phys_offset		// x24=PHYS_OFFSET, x28=PHYS_OFFSET-PAGE_OFFSET
+ 	bl	set_cpu_boot_mode_flag
++
++#ifdef CONFIG_HTC_DEBUG_FOOTPRINT
++       MPIDR2INDEX     x0, x1
++       VIRT2PHYS       x1, mnemosyne_phys, secondary_holding_pen, x2
++       ldr             x1, [x1]                                        /* Store mnemosyne_phys in x1 */
++
++       cmp     x1, #0
++       beq     skip_footprint                                          /* If phys is NULL, skip it */
++
++       ldr     x2, =mnemosyne_kernel_exit_counter_from_cpu             /* Get the offset of an element */
++       add     x2, x1, x2                                              /* Get the address of an element */
++       add     x2, x2, x0, LSL #MNEMOSYNE_ELEMENT_SIZE_BIT_SHIFT       /* calculate data offset with cpu index first. */
++
++       ldr     x3, [x2]
++       add     x3, x3, #1
++       str     x3, [x2]
++       dsb     sy
++
++       ldr     x2, =mnemosyne_kernel_footprint_cpu                     /* Get the offset of an element */
++       add     x2, x1, x2                                              /* Get the address of an element */
++       add     x2, x2, x0, LSL #MNEMOSYNE_ELEMENT_SIZE_BIT_SHIFT       /* calculate data offset with cpu index first. */
++
++       ldr     x3, =0x05
++       strb    w3, [x2]                                                /* write footprint 5, only the lowest byte */
++       dsb     sy
++
++       skip_footprint:
++#endif
++
+ 	mrs	x0, mpidr_el1
+ 	ldr     x1, =MPIDR_HWID_BITMASK
+ 	and	x0, x0, x1
+diff --git a/arch/arm64/kernel/sleep.S b/arch/arm64/kernel/sleep.S
+index 0ff3eba..970d499 100644
+--- a/arch/arm64/kernel/sleep.S
++++ b/arch/arm64/kernel/sleep.S
+@@ -3,6 +3,10 @@
+ #include <asm/asm-offsets.h>
+ #include <asm/assembler.h>
+ 
++#ifdef CONFIG_HTC_DEBUG_FOOTPRINT
++#include <htc_mnemosyne/htc_footprint.h>
++#endif
++
+ 	.text
+ /*
+  * Implementation of MPIDR_EL1 hash algorithm through shifting
+@@ -123,6 +127,36 @@ ENTRY(cpu_resume)
+ #else
+ 	mov	x7, xzr
+ #endif
++
++#ifdef CONFIG_HTC_DEBUG_FOOTPRINT
++	MPIDR2INDEX x0, x1
++
++	VIRT2PHYS x1, mnemosyne_phys, cpu_resume, x2
++	ldr	x1, [x1]
++
++	cmp	x1, #0
++	beq	1f							/* if base is NULL, skip it. */
++
++	ldr	x2, =mnemosyne_kernel_exit_counter_from_cpu		/* Get the offset of an element */
++	add	x3, x1, x2						/* Get the address of an element */
++	add	x3, x3, x0, LSL #MNEMOSYNE_ELEMENT_SIZE_BIT_SHIFT	/* calculate data offset with cpu index first. */
++
++	ldr	x2, [x3]
++	add	x2, x2, #1
++	str	x2, [x3]
++	dsb	sy
++
++	ldr	x2, =mnemosyne_kernel_footprint_cpu			/* Get the offset of an element */
++	add	x3, x1, x2						/* Get the address of an element */
++	add	x3, x3, x0, LSL #MNEMOSYNE_ELEMENT_SIZE_BIT_SHIFT	/* calculate data offset with cpu index first. */
++
++	mov	x2, #4
++	strb	w2, [x3] 						/* write footprint 4 */
++	dsb	sy
++
++	1:
++#endif
++
+ 	adrp	x0, sleep_save_sp
+ 	add	x0, x0, #:lo12:sleep_save_sp
+ 	ldr	x0, [x0, #SLEEP_SAVE_SP_PHYS]
+diff --git a/arch/arm64/kernel/traps.c b/arch/arm64/kernel/traps.c
+index 2198961..d44403b 100644
+--- a/arch/arm64/kernel/traps.c
++++ b/arch/arm64/kernel/traps.c
+@@ -247,6 +247,12 @@ static unsigned long oops_begin(void)
+ 
+ static void oops_end(unsigned long flags, struct pt_regs *regs, int notify)
+ {
++#if defined(CONFIG_HTC_DEBUG_KP)
++        struct thread_info *thread = current_thread_info();
++        char sym_pc[KSYM_SYMBOL_LEN];
++        char sym_lr[KSYM_SYMBOL_LEN];
++#endif
++
+ 	if (regs && kexec_should_crash(current))
+ 		crash_kexec(regs);
+ 
+@@ -260,10 +266,23 @@ static void oops_end(unsigned long flags, struct pt_regs *regs, int notify)
+ 	raw_local_irq_restore(flags);
+ 	oops_exit();
+ 
++#if defined(CONFIG_HTC_DEBUG_KP)
++        sprint_symbol(sym_pc, regs->pc);
++        sprint_symbol(sym_lr, (compat_user_mode(regs))? regs->compat_lr:regs->regs[30]);
++#endif
++
+ 	if (in_interrupt())
++#if defined(CONFIG_HTC_DEBUG_KP)
++                panic("%.*s PC:%s LR:%s", TASK_COMM_LEN, thread->task->comm, sym_pc, sym_lr);
++#else
+ 		panic("Fatal exception in interrupt");
++#endif
+ 	if (panic_on_oops)
++#if defined(CONFIG_HTC_DEBUG_KP)
++                panic("%.*s PC:%s LR:%s", TASK_COMM_LEN, thread->task->comm, sym_pc, sym_lr);
++#else
+ 		panic("Fatal exception");
++#endif
+ 	if (notify != NOTIFY_STOP)
+ 		do_exit(SIGSEGV);
+ }
+diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
+index 7161b9c..ead9733 100644
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -40,6 +40,10 @@
+ 
+ #include <trace/events/exception.h>
+ 
++#if defined(CONFIG_HTC_DEBUG_RTB)
++#include <linux/msm_rtb.h>
++#endif
++
+ static const char *fault_name(unsigned int esr);
+ 
+ /*
+@@ -90,12 +94,25 @@ static void __do_kernel_fault(struct mm_struct *mm, unsigned long addr,
+ 	/*
+ 	 * Are we prepared to handle this kernel fault?
+ 	 */
++#if defined(CONFIG_HTC_DEBUG_RTB)
++       static int enable_logk_die = 1;
++#endif
+ 	if (fixup_exception(regs))
+ 		return;
+ 
+ 	/*
+ 	 * No handler, we'll have to terminate things with extreme prejudice.
+ 	 */
++#if defined(CONFIG_HTC_DEBUG_RTB)
++       if (enable_logk_die) {
++               uncached_logk(LOGK_DIE, (void *)regs->pc);
++               uncached_logk(LOGK_DIE, (void *)regs->regs[30]);
++               uncached_logk(LOGK_DIE, (void *)addr);
++
++               msm_rtb_disable();
++               enable_logk_die = 0;
++       }
++#endif
+ 	bust_spinlocks(1);
+ 	pr_alert("Unable to handle kernel %s at virtual address %08lx\n",
+ 		 (addr < PAGE_SIZE) ? "NULL pointer dereference" :
+diff --git a/drivers/base/power/wakeup.c b/drivers/base/power/wakeup.c
+index 79715e7..af971c6 100644
+--- a/drivers/base/power/wakeup.c
++++ b/drivers/base/power/wakeup.c
+@@ -855,6 +855,32 @@ static int print_wakeup_source_stats(struct seq_file *m,
+ 	return ret;
+ }
+ 
++#ifdef CONFIG_HTC_POWER_DEBUG
++void htc_print_wakeup_source(struct wakeup_source *ws)
++{
++         if (ws->active) {
++                 if (ws->timer_expires) {
++                         long timeout = ws->timer_expires - jiffies;
++                         if (timeout > 0)
++                                 printk(" '%s', time left %ld ticks; ", ws->name, timeout);
++                 } else
++                         printk(" '%s' ", ws->name);
++         }
++}
++
++void htc_print_active_wakeup_sources(void)
++{
++         struct wakeup_source *ws;
++
++         printk("wakeup sources: ");
++        rcu_read_lock();
++         list_for_each_entry_rcu(ws, &wakeup_sources, entry)
++                 htc_print_wakeup_source(ws);
++        rcu_read_unlock();
++         printk("\n");
++}
++#endif
++
+ /**
+  * wakeup_sources_stats_show - Print wakeup sources statistics information.
+  * @m: seq_file to print the statistics into.
+diff --git a/drivers/char/diag/diagfwd_htc.c b/drivers/char/diag/diagfwd_htc.c
+new file mode 100644
+index 0000000..a4ff62b
+--- /dev/null
++++ b/drivers/char/diag/diagfwd_htc.c
+@@ -0,0 +1,44 @@
++
++
++void __diagfwd_dbg_raw_data(void *buf, const char *src, unsigned dbg_flag, unsigned mask)
++{
++	static char reason_str[128];
++	int len;
++
++	switch (dbg_flag) {
++	case DIAG_DBG_READ:
++		len = sprintf(reason_str, "Read Packet Data from %s", src);
++		break;
++	case DIAG_DBG_WRITE:
++		len = sprintf(reason_str, "Write Packet Data to %s", src);
++		break;
++	case DIAG_DBG_DROP:
++		len = sprintf(reason_str, "Drop Packet Data from %s", src);
++		break;
++	default:
++		
++		return;
++	}
++
++	if (mask || dbg_flag == DIAG_DBG_DROP) {
++		
++		len = sprintf(reason_str + len, "(%s)", "first 16 bytes");
++#if DIAG_XPST
++		} else if (driver->debug_dmbytes_recv > 0) {
++		
++			len = sprintf(reason_str + len, "(%s)", "for DM command");
++			driver->debug_dmbytes_recv--;
++#endif
++	} else if (driver->qxdmusb_drop && driver->logging_mode == USB_MODE) {
++	
++		len = sprintf(reason_str + len, "(%s)", "Unknown packet");
++	} else {
++		
++		return;
++	}
++	if (diag7k_debug_mask || diag9k_debug_mask)
++		print_hex_dump(KERN_INFO, reason_str, DUMP_PREFIX_ADDRESS, 16, 1, buf, 16, 1);
++	else
++		print_hex_dump(KERN_DEBUG, reason_str, DUMP_PREFIX_ADDRESS, 16, 1, buf, 16, 1);
++}
++
+diff --git a/drivers/clk/qcom/clock-generic.c b/drivers/clk/qcom/clock-generic.c
+index 6528aa6..ea28438 100644
+--- a/drivers/clk/qcom/clock-generic.c
++++ b/drivers/clk/qcom/clock-generic.c
+@@ -21,6 +21,9 @@
+ #include <soc/qcom/msm-clock-controller.h>
+ 
+ /* ==================== Mux clock ==================== */
++#if defined(CONFIG_HTC_DEBUG_FOOTPRINT) && defined(CONFIG_ARCH_MSM8994)
++#include <htc_mnemosyne/htc_footprint.h>
++#endif
+ 
+ static int mux_parent_to_src_sel(struct mux_clk *mux, struct clk *p)
+ {
+@@ -103,6 +106,10 @@ static int mux_set_rate(struct clk *c, unsigned long rate)
+ 	 * Check if one of the possible parents is already at the requested
+ 	 * rate.
+ 	 */
++#if defined(CONFIG_HTC_DEBUG_FOOTPRINT)
++        set_acpuclk_footprint_by_clk(c, ACPU_BEFORE_SAFE_PARENT_INIT);
++#endif
++
+ 	for (i = 0; i < mux->num_parents && mux->try_get_rate; i++) {
+ 		struct clk *p = mux->parents[i].src;
+ 		if (p->rate == rate && clk_round_rate(p, rate) == rate) {
+@@ -131,6 +138,10 @@ static int mux_set_rate(struct clk *c, unsigned long rate)
+ 	 * (indicated by try_new_parent), and the new source is not the current
+ 	 * parent, do not switch to the safe parent.
+ 	 */
++#if defined(CONFIG_HTC_DEBUG_FOOTPRINT)
++        set_acpuclk_footprint_by_clk(c, ACPU_BEFORE_SET_SAFE_RATE);
++#endif
++
+ 	if (mux->safe_sel >= 0 &&
+ 		!(mux->try_new_parent && (new_parent != c->parent))) {
+ 		/*
+@@ -158,24 +169,48 @@ static int mux_set_rate(struct clk *c, unsigned long rate)
+ 			return rc;
+ 
+ 	}
+-
++#if defined(CONFIG_HTC_DEBUG_FOOTPRINT)
++        set_acpuclk_footprint_by_clk(c, ACPU_BEFORE_SET_PARENT_RATE);
++#endif
+ 	new_par_curr_rate = clk_get_rate(new_parent);
+ 	rc = clk_set_rate(new_parent, rate);
+ 	if (rc)
+ 		goto set_rate_fail;
+ 
++#if defined(CONFIG_HTC_DEBUG_FOOTPRINT)
++        set_acpuclk_footprint_by_clk(c, ACPU_BEFORE_CLK_UNPREPARE);
++#endif
++
+ 	rc = mux_set_parent(c, new_parent);
+ 	if (rc)
+ 		goto set_par_fail;
+ 
++#if defined(CONFIG_HTC_DEBUG_FOOTPRINT)
++        set_acpuclk_cpu_freq_footprint_by_clk(FT_CUR_RATE, c, rate);
++        set_acpuclk_l2_freq_footprint_by_clk(FT_CUR_RATE, c, rate);
++#endif
++
++#if defined(CONFIG_HTC_DEBUG_FOOTPRINT)
++        set_acpuclk_footprint_by_clk(c, ACPU_BEFORE_RETURN);
++#endif
++
+ 	return 0;
+ 
+ set_par_fail:
++#if defined(CONFIG_HTC_DEBUG_FOOTPRINT)
++        set_acpuclk_footprint_by_clk(c, ACPU_BEFORE_ERR_CLK_UNPREPARE);
++#endif
+ 	clk_set_rate(new_parent, new_par_curr_rate);
+ set_rate_fail:
++#if defined(CONFIG_HTC_DEBUG_FOOTPRINT)
++        set_acpuclk_footprint_by_clk(c, ACPU_BEFORE_ERR_SET_PARENT_RATE);
++#endif
+ 	WARN(mux->ops->set_mux_sel(mux,
+ 		mux_parent_to_src_sel(mux, c->parent)),
+ 		"Set rate failed for %s. Also in bad state!\n", c->dbg_name);
++#if defined(CONFIG_HTC_DEBUG_FOOTPRINT)
++        set_acpuclk_footprint_by_clk(c, ACPU_BEFORE_ERR_RETURN);
++#endif
+ 	return rc;
+ }
+ 
+diff --git a/drivers/clk/qcom/clock.c b/drivers/clk/qcom/clock.c
+index e9d2677..a8245da 100644
+--- a/drivers/clk/qcom/clock.c
++++ b/drivers/clk/qcom/clock.c
+@@ -842,6 +842,9 @@ int msm_clock_register(struct clk_lookup *table, size_t size)
+ 	/* maintain backwards compatibility */
+ 	if (table[0].con_id || table[0].dev_id)
+ 		clkdev_add_table(table, size);
++#ifdef CONFIG_HTC_POWER_DEBUG
++        htc_clock_status_debug_init(table, size);
++#endif
+ 
+ 	do {
+ 		found_more_clks = false;
+@@ -922,6 +925,10 @@ EXPORT_SYMBOL(of_msm_clock_register);
+  */
+ int __init msm_clock_init(struct clock_init_data *data)
+ {
++#ifdef CONFIG_HTC_POWER_DEBUG
++        struct clk_lookup *clock_tbl;
++        size_t num_clocks;
++#endif
+ 	if (!data)
+ 		return -EINVAL;
+ 
+@@ -938,6 +945,9 @@ int __init msm_clock_init(struct clock_init_data *data)
+ 	if (data->post_init)
+ 		data->post_init();
+ 
++#ifdef CONFIG_HTC_POWER_DEBUG
++        clock_blocked_register(clock_tbl, num_clocks);
++#endif
+ 	return 0;
+ }
+ 
+diff --git a/drivers/clk/qcom/clock.h b/drivers/clk/qcom/clock.h
+index bee7699..6920367 100644
+--- a/drivers/clk/qcom/clock.h
++++ b/drivers/clk/qcom/clock.h
+@@ -41,12 +41,24 @@ extern struct list_head orphan_clk_list;
+ #ifdef CONFIG_DEBUG_FS
+ int clock_debug_register(struct clk *clk);
+ void clock_debug_print_enabled(void);
++#ifdef CONFIG_HTC_POWER_DEBUG
++int htc_clock_status_debug_init(struct clk_lookup *table, size_t size);
++#endif
+ #else
+ static inline int clock_debug_register(struct clk *unused)
+ {
+ 	return 0;
+ }
+ static inline void clock_debug_print_enabled(void) { return; }
++#ifdef CONFIG_HTC_POWER_DEBUG
++static int htc_clock_status_debug_init(struct clk_lookup *table, size_t size)
++{ return 0; }
++#endif
++#endif
++
++#ifdef CONFIG_HTC_POWER_DEBUG
++void clock_blocked_print(void);
++int clock_blocked_register(struct clk_lookup *table, size_t size);
+ #endif
+ 
+ #endif
+diff --git a/drivers/devfreq/devfreq_simple_dev.c b/drivers/devfreq/devfreq_simple_dev.c
+index a571867..21c64cd 100644
+--- a/drivers/devfreq/devfreq_simple_dev.c
++++ b/drivers/devfreq/devfreq_simple_dev.c
+@@ -29,6 +29,9 @@
+ #include <linux/of.h>
+ #include <linux/clk.h>
+ #include <trace/events/power.h>
++#ifdef CONFIG_HTC_DEBUG_FOOTPRINT
++#include <htc_mnemosyne/htc_footprint.h>
++#endif
+ 
+ struct dev_data {
+ 	struct clk *clk;
+@@ -63,6 +66,12 @@ static int dev_target(struct device *dev, unsigned long *freq, u32 flags)
+ 	struct dev_data *d = dev_get_drvdata(dev);
+ 
+ 	find_freq(&d->profile, freq, flags);
++
++#ifdef CONFIG_HTC_DEBUG_FOOTPRINT
++        set_acpuclk_l2_freq_footprint(FT_PREV_RATE, clk_get_rate(d->clk));
++        set_acpuclk_l2_freq_footprint(FT_NEW_RATE, *freq * 1000);
++#endif
++
+ 	return clk_set_rate(d->clk, *freq * 1000);
+ }
+ 
+diff --git a/drivers/firmware/qcom/Kconfig b/drivers/firmware/qcom/Kconfig
+index 61c7974..ae1cfe2 100644
+--- a/drivers/firmware/qcom/Kconfig
++++ b/drivers/firmware/qcom/Kconfig
+@@ -5,3 +5,8 @@ config MSM_TZ_LOG
+           This option enables a driver with a debugfs interface for messages
+           produced by the Secure code (Trust zone). These messages provide
+           diagnostic information about TZ operation.
++
++config HTC_TZ_LOG
++        tristate "HTC MSM Trust Zone (TZ) Log"
++        depends on MSM_TZ_LOG
++        default y
+diff --git a/drivers/irqchip/irq-gic.c b/drivers/irqchip/irq-gic.c
+index ac7b694..19f291f 100644
+--- a/drivers/irqchip/irq-gic.c
++++ b/drivers/irqchip/irq-gic.c
+@@ -44,12 +44,22 @@
+ #include <linux/irqchip/arm-gic.h>
+ #include <linux/syscore_ops.h>
+ #include <linux/msm_rtb.h>
++#include <linux/htc_debug_tools.h>
+ 
+ #include <asm/irq.h>
+ #include <asm/exception.h>
+ #include <asm/smp_plat.h>
+ 
+ #include "irqchip.h"
++#ifdef CONFIG_HTC_POWER_DEBUG
++#define GIC_SPI_START 32
++#define EE0_KRAIT_HLOS_SPMI_PERIPH_IRQ (GIC_SPI_START + 190)
++#define TLMM_MSM_SUMMARY_IRQ (GIC_SPI_START + 208)
++#endif
++
++#ifdef CONFIG_HTC_DEBUG_WATCHDOG
++#include <linux/htc_debug_tools.h>
++#endif
+ 
+ union gic_base {
+ 	void __iomem *common_base;
+@@ -298,6 +308,11 @@ static void gic_show_resume_irq(struct gic_chip_data *gic)
+ 
+ 		pr_warning("%s: %d triggered %s\n", __func__,
+ 					i + gic->irq_offset, name);
++#ifdef CONFIG_HTC_POWER_DEBUG
++                 if (EE0_KRAIT_HLOS_SPMI_PERIPH_IRQ != i + gic->irq_offset)
++                         if (TLMM_MSM_SUMMARY_IRQ != i + gic->irq_offset)
++                                 pr_info("[WAKEUP] Resume caused by gic-%d\n", i + gic->irq_offset);
++#endif
+ 	}
+ }
+ 
+@@ -473,9 +488,20 @@ static asmlinkage void __exception_irq_entry gic_handle_irq(struct pt_regs *regs
+ 		irqnr = irqstat & ~0x1c00;
+ 
+ 		if (likely(irqnr > 15 && irqnr < 1021)) {
++#if defined(CONFIG_HTC_DEBUG_WATCHDOG)
++
++                        if (irqnr == 20 && smp_processor_id() == 0) {
++                                unsigned long long timestamp = sched_clock();
++                                htc_debug_watchdog_check_pet(timestamp);
++                        }
++#endif
+ 			irqnr = irq_find_mapping(gic->domain, irqnr);
+ 			handle_IRQ(irqnr, regs);
++#if defined(CONFIG_HTC_DEBUG_RTB)
++                        uncached_logk_pc(LOGK_IRQ, (void *)(uintptr_t)htc_debug_get_sched_clock_ms(), (void *)(uintptr_t)irqnr);
++#else
+ 			uncached_logk(LOGK_IRQ, (void *)(uintptr_t)irqnr);
++#endif
+ 			continue;
+ 		}
+ 		if (irqnr < 16) {
+@@ -483,7 +509,11 @@ static asmlinkage void __exception_irq_entry gic_handle_irq(struct pt_regs *regs
+ #ifdef CONFIG_SMP
+ 			handle_IPI(irqnr, regs);
+ #endif
++#if defined(CONFIG_HTC_DEBUG_RTB)
++                        uncached_logk_pc(LOGK_IRQ, (void *)(uintptr_t)htc_debug_get_sched_clock_ms(), (void *)(uintptr_t)irqnr);
++#else
+ 			uncached_logk(LOGK_IRQ, (void *)(uintptr_t)irqnr);
++#endif
+ 			continue;
+ 		}
+ 		break;
+@@ -1117,3 +1147,22 @@ IRQCHIP_DECLARE(msm_8660_qgic, "qcom,msm-8660-qgic", gic_of_init);
+ IRQCHIP_DECLARE(msm_qgic2, "qcom,msm-qgic2", gic_of_init);
+ 
+ #endif
++
++bool gic_is_irq_pending(unsigned int irq)
++{
++        struct irq_data *d = irq_get_irq_data(irq);
++        struct gic_chip_data *gic_data = &gic_data[0];
++        u32 mask, val;
++
++        WARN_ON(!irqs_disabled());
++        raw_spin_lock(&irq_controller_lock);
++        mask = 1 << (gic_irq(d) % 32);
++        val = readl(gic_dist_base(d) +
++                        GIC_DIST_ENABLE_SET + (gic_irq(d) / 32) * 4);
++
++        WARN_ON(val & mask);
++        val = readl(gic_dist_base(d) +
++                        GIC_DIST_PENDING_SET + (gic_irq(d) / 32) * 4);
++        raw_spin_unlock(&irq_controller_lock);
++        return (bool) (val & mask);
++}
+diff --git a/drivers/platform/msm/msm_bus/msm_bus_adhoc.h b/drivers/platform/msm/msm_bus/msm_bus_adhoc.h
+index cad0c53..332f222 100644
+--- a/drivers/platform/msm/msm_bus/msm_bus_adhoc.h
++++ b/drivers/platform/msm/msm_bus/msm_bus_adhoc.h
+@@ -120,7 +120,11 @@ int msm_bus_enable_limiter(struct msm_bus_node_device_type *nodedev,
+ 				bool throttle_en, uint64_t lim_bw);
+ int msm_bus_update_clks(struct msm_bus_node_device_type *nodedev,
+ 	int ctx, int **dirty_nodes, int *num_dirty);
++#ifdef CONFIG_HTC_DEBUG_MSMBUS
++int msm_bus_commit_data(int *dirty_nodes, int ctx, int num_dirty, int cl);
++#else
+ int msm_bus_commit_data(int *dirty_nodes, int ctx, int num_dirty);
++#endif
+ int msm_bus_update_bw(struct msm_bus_node_device_type *nodedev, int ctx,
+ 	int64_t add_bw, int **dirty_nodes, int *num_dirty);
+ void *msm_bus_realloc_devmem(struct device *dev, void *p, size_t old_size,
+@@ -136,6 +140,16 @@ extern int msm_bus_of_get_static_rules(struct platform_device *pdev,
+ extern int msm_rules_update_path(struct list_head *input_list,
+ 				struct list_head *output_list);
+ extern void print_all_rules(void);
++
++#ifdef CONFIG_HTC_DEBUG_MSMBUS
++#define HTC_MAX_NOC_NOC     8
++#define HTC_MAX_NOC_CLIENT  64
++#define HTC_MAX_NOC_NAME    32
++#define HTC_MAX_NOC_LOG_BUF    8192
++#define HTC_MAX_NOC_LOG_LENGTH 128
++extern char htc_noc_client_name[HTC_MAX_NOC_CLIENT][HTC_MAX_NOC_NAME];
++#endif
++
+ #ifdef CONFIG_DEBUG_BUS_VOTER
+ int msm_bus_floor_init(struct device *dev);
+ #else
+diff --git a/drivers/platform/msm/msm_bus/msm_bus_arb_adhoc.c b/drivers/platform/msm/msm_bus/msm_bus_arb_adhoc.c
+index 324d666..644b749 100644
+--- a/drivers/platform/msm/msm_bus/msm_bus_arb_adhoc.c
++++ b/drivers/platform/msm/msm_bus/msm_bus_arb_adhoc.c
+@@ -529,8 +529,14 @@ static uint64_t get_node_ib(struct msm_bus_node_device_type *bus_dev)
+ 	return max_ib;
+ }
+ 
++#ifdef CONFIG_HTC_DEBUG_MSMBUS
++static int update_path(int src, int dest, uint64_t req_ib, uint64_t req_bw,
++                       uint64_t cur_ib, uint64_t cur_bw, int src_idx, int ctx, int cl)
++#else
+ static int update_path(int src, int dest, uint64_t req_ib, uint64_t req_bw,
+ 			uint64_t cur_ib, uint64_t cur_bw, int src_idx, int ctx)
++#endif
++
+ {
+ 	struct device *src_dev = NULL;
+ 	struct device *next_dev = NULL;
+@@ -622,7 +628,11 @@ static int update_path(int src, int dest, uint64_t req_ib, uint64_t req_bw,
+ 		msm_bus_apply_rules(&apply_list, false);
+ 	}
+ 
++#ifdef CONFIG_HTC_DEBUG_MSMBUS
++        msm_bus_commit_data(dirty_nodes, ctx, num_dirty, cl);
++#else
+ 	msm_bus_commit_data(dirty_nodes, ctx, num_dirty);
++#endif
+ 
+ 	if (rules_registered) {
+ 		msm_bus_apply_rules(&apply_list, true);
+@@ -648,8 +658,14 @@ static int remove_path(int src, int dst, uint64_t cur_ib, uint64_t cur_ab,
+ 	 * this cient on all paths
+ 	 */
+ 
++#ifdef CONFIG_HTC_DEBUG_MSMBUS
++        ret = update_path(src, dst, 0, 0, cur_ib, cur_ab, src_idx,
++                                                        active_only, 0);
++#else
+ 	ret = update_path(src, dst, 0, 0, cur_ib, cur_ab, src_idx,
+ 							active_only);
++#endif
++
+ 	if (ret) {
+ 		MSM_BUS_ERR("%s: Error zeroing out path ctx %d",
+ 					__func__, ACTIVE_CTX);
+@@ -891,6 +907,14 @@ static uint32_t register_client_adhoc(struct msm_bus_scale_pdata *pdata)
+ 					handle);
+ 	MSM_BUS_DBG("%s:Client handle %d %s", __func__, handle,
+ 						client->pdata->name);
++
++#ifdef CONFIG_HTC_DEBUG_MSMBUS
++        if(handle >= HTC_MAX_NOC_CLIENT) {
++                pr_err("[MSMBUS] too many client handles. Out of range.\n");
++                goto exit_register_client;
++        }
++        strncpy(htc_noc_client_name[handle], client->pdata->name, HTC_MAX_NOC_NAME);
++#endif
+ exit_register_client:
+ 	mutex_unlock(&msm_bus_adhoc_lock);
+ 	return handle;
+@@ -962,9 +986,13 @@ static int update_request_adhoc(uint32_t cl, unsigned int index)
+ 			MSM_BUS_DBG("%s:ab: %llu ib: %llu\n", __func__,
+ 					curr_bw, curr_clk);
+ 		}
+-
++#ifdef CONFIG_HTC_DEBUG_MSMBUS
++                ret = update_path(src, dest, req_clk, req_bw,
++                                curr_clk, curr_bw, lnode, pdata->active_only, cl);
++#else
+ 		ret = update_path(src, dest, req_clk, req_bw,
+ 				curr_clk, curr_bw, lnode, pdata->active_only);
++#endif
+ 
+ 		if (ret) {
+ 			MSM_BUS_ERR("%s: Update path failed! %d ctx %d\n",
+diff --git a/drivers/power/qcom/idle.h b/drivers/power/qcom/idle.h
+index 5b2f59f..53484eb 100644
+--- a/drivers/power/qcom/idle.h
++++ b/drivers/power/qcom/idle.h
+@@ -19,6 +19,9 @@
+ 
+ #ifndef __ASSEMBLY__
+ #if defined(CONFIG_CPU_V7) || defined(CONFIG_ARM64)
++#ifdef CONFIG_HTC_DEBUG_FOOTPRINT$
++void get_pm_boot_vector_symbol_address(unsigned *addr);
++#endif
+ extern unsigned long msm_pm_boot_vector[MAX_NUM_CLUSTER * MAX_CPUS_PER_CLUSTER];
+ void msm_pm_boot_entry(void);
+ #else
+diff --git a/fs/pstore/inode.c b/fs/pstore/inode.c
+index e4bcb2c..97f37b0 100644
+--- a/fs/pstore/inode.c
++++ b/fs/pstore/inode.c
+@@ -36,6 +36,7 @@
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
+ #include <linux/uaccess.h>
++#include <linux/htc_debug_tools.h>
+ 
+ #include "internal.h"
+ 
+@@ -128,6 +129,11 @@ static ssize_t pstore_file_read(struct file *file, char __user *userbuf,
+ 
+ 	if (ps->type == PSTORE_TYPE_FTRACE)
+ 		return seq_read(file, userbuf, count, ppos);
++#if defined(CONFIG_HTC_DEBUG_BOOTLOADER_LOG)
++        if (ps->type == PSTORE_TYPE_CONSOLE) {
++                return bldr_log_read(ps->data, ps->size, userbuf, count, ppos);
++        }
++#endif
+ 	return simple_read_from_buffer(userbuf, count, ppos, ps->data, ps->size);
+ }
+ 
+diff --git a/fs/pstore/ram.c b/fs/pstore/ram.c
+index 058f17f..7cad1af 100644
+--- a/fs/pstore/ram.c
++++ b/fs/pstore/ram.c
+@@ -34,6 +34,7 @@
+ #include <linux/slab.h>
+ #include <linux/compiler.h>
+ #include <linux/pstore_ram.h>
++#include <linux/htc_debug_tools.h>
+ 
+ #define RAMOOPS_KERNMSG_HDR "===="
+ #define MIN_MEM_SIZE 4096UL
+@@ -485,6 +486,13 @@ static int ramoops_probe(struct platform_device *pdev)
+ 		cxt->size, (unsigned long long)cxt->phys_addr,
+ 		cxt->ecc_info.ecc_size, cxt->ecc_info.block_size);
+ 
++#if defined(CONFIG_HTC_DEBUG_BOOTLOADER_LOG)
++        if (cxt->console_size)
++        {
++                bldr_log_init();
++        }
++#endif
++
+ 	return 0;
+ 
+ fail_buf:
+@@ -517,6 +525,9 @@ static int __exit ramoops_remove(struct platform_device *pdev)
+ 	/* TODO(kees): When pstore supports unregistering, call it here. */
+ 	kfree(cxt->pstore.buf);
+ 	cxt->pstore.bufsize = 0;
++#if defined(CONFIG_HTC_DEBUG_BOOTLOADER_LOG)
++        bldr_log_release();
++#endif
+ 
+ 	return 0;
+ #endif
+diff --git a/sound/usb/pcm.c b/sound/usb/pcm.c
+index 0d7a872..5102cf4 100644
+--- a/sound/usb/pcm.c
++++ b/sound/usb/pcm.c
+@@ -700,6 +700,12 @@ static int snd_usb_pcm_prepare(struct snd_pcm_substream *substream)
+ 		goto unlock;
+ 
+ 	iface = usb_ifnum_to_if(subs->dev, subs->cur_audiofmt->iface);
++        if (iface == NULL) {
++                snd_printk(KERN_ERR "%s: data interface not found!\n", __func__);
++                ret = -ENODEV;
++                goto unlock;
++        }
++
+ 	alts = &iface->altsetting[subs->cur_audiofmt->altset_idx];
+ 	ret = snd_usb_init_sample_rate(subs->stream->chip,
+ 				       subs->cur_audiofmt->iface,
+-- 
+2.1.4
+
